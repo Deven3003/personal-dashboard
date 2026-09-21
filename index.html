@@ -8,19 +8,22 @@
 <title>My Personal Dashboard</title>
 <style>
 *{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",Arial,sans-serif;background:#f4f7fb;color:#172033}
-.app{max-width:520px;margin:auto;min-height:100vh;padding-bottom:88px}header{padding:26px 20px 18px;background:linear-gradient(135deg,#0b63f6,#5b8cff);color:#fff;border-radius:0 0 28px 28px}
+.app{max-width:520px;margin:auto;min-height:100vh;padding-bottom:88px}.hidden{display:none!important}
+header{padding:26px 20px 18px;background:linear-gradient(135deg,#0b63f6,#5b8cff);color:#fff;border-radius:0 0 28px 28px}
 .small{opacity:.88;font-size:14px}.title{font-size:28px;font-weight:800;margin:6px 0}.quote{font-size:14px;opacity:.9;margin-top:10px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:18px}
 .stat{background:#ffffff22;padding:12px;border-radius:16px;text-align:center}.stat b{display:block;font-size:21px}.stat span{font-size:11px;opacity:.9}
 main{padding:18px}.section{display:flex;justify-content:space-between;align-items:center;margin:5px 0 12px}.section h2{font-size:18px;margin:0}.link{color:#0b63f6;font-size:13px;font-weight:600}
 .task{background:#fff;border-radius:18px;padding:14px;margin-bottom:10px;display:flex;gap:12px;align-items:center;box-shadow:0 5px 18px #1e375a12}.check{width:28px;height:28px;border:2px solid #cbd5e1;border-radius:50%;background:white;flex:none}.check.done{background:#16a34a;border-color:#16a34a;color:#fff}.task.done .task-title{text-decoration:line-through;color:#8993a3}.task-title{font-size:14px;font-weight:700}.task small{display:block;color:#7b8494;margin-top:3px}
 .add{width:100%;border:0;background:#0b63f6;color:#fff;padding:13px;border-radius:14px;font-size:15px;font-weight:700;margin:5px 0 20px}.modules{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.module{background:#fff;border-radius:16px;padding:14px 8px;text-align:center;box-shadow:0 5px 18px #1e375a0d;font-size:12px}.icon{font-size:24px;display:block;margin-bottom:7px}
 .ai{background:linear-gradient(135deg,#111827,#263b63);color:#fff;border-radius:18px;padding:16px;margin-top:12px}.ai p{font-size:14px;line-height:1.5}.btn{background:#0b63f6;color:#fff;border:0;border-radius:12px;padding:10px 14px;font-weight:700}
-nav{position:fixed;bottom:0;left:0;right:0;background:#fffffff5;border-top:1px solid #e4e8ef;display:flex;justify-content:center;z-index:10;padding:8px 0 calc(8px + env(safe-area-inset-bottom))}nav div{width:20%;text-align:center;font-size:10px;color:#687386}nav .active{color:#0b63f6;font-weight:700}nav span{display:block;font-size:21px;margin-bottom:2px}
+.chatbox{background:#fff;border-radius:18px;padding:14px;min-height:55vh;box-shadow:0 5px 18px #1e375a12;display:flex;flex-direction:column}.messages{flex:1;overflow:auto;padding:4px}.bubble{max-width:85%;padding:11px 13px;border-radius:16px;margin:8px 0;font-size:14px;line-height:1.45;white-space:pre-wrap}.user{margin-left:auto;background:#0b63f6;color:white;border-bottom-right-radius:5px}.assistant{background:#eef3f9;color:#172033;border-bottom-left-radius:5px}.composer{display:flex;gap:8px;margin-top:10px}.composer input{flex:1;border:1px solid #d6deea;border-radius:14px;padding:12px;font-size:14px;outline:none}.send{border:0;border-radius:14px;background:#0b63f6;color:#fff;width:48px;font-size:19px}.status{font-size:11px;color:#7b8494;margin:6px 2px}.chiprow{display:flex;gap:7px;overflow:auto;margin-bottom:8px}.chip{border:0;background:#edf3ff;color:#0b63f6;border-radius:20px;padding:8px 11px;white-space:nowrap;font-size:11px}
+nav{position:fixed;bottom:0;left:0;right:0;background:#fffffff5;border-top:1px solid #e4e8ef;display:flex;justify-content:center;z-index:10;padding:8px 0 calc(8px + env(safe-area-inset-bottom))}nav button{width:20%;border:0;background:transparent;text-align:center;font-size:10px;color:#687386}nav button.active{color:#0b63f6;font-weight:700}nav span{display:block;font-size:21px;margin-bottom:2px}
 @media(min-width:521px){nav{max-width:520px;margin:auto}}
 </style>
 </head>
 <body>
 <div class="app">
+<section id="home">
 <header>
 <div class="small" id="greeting"></div><div class="title">Your Personal Dashboard</div>
 <div class="quote">Small steps every day, big results over time.</div>
@@ -28,28 +31,52 @@ nav{position:fixed;bottom:0;left:0;right:0;background:#fffffff5;border-top:1px s
 </header>
 <main>
 <div class="section"><h2>Today's Tasks</h2><span class="link" onclick="clearCompleted()">Clear completed</span></div>
-<div id="tasks"></div>
-<button class="add" onclick="addTask()">＋ Add Task</button>
-
+<div id="tasks"></div><button class="add" onclick="addTask()">＋ Add Task</button>
 <div class="section"><h2>Modules</h2></div>
 <div class="modules">
 <div class="module"><span class="icon">💼</span>Work</div><div class="module"><span class="icon">🤖</span>AI Project</div><div class="module"><span class="icon">🏨</span>Resort</div>
 <div class="module"><span class="icon">💰</span>Finance</div><div class="module"><span class="icon">📚</span>Learning</div><div class="module"><span class="icon">🎬</span>YouTube</div>
 </div>
-
 <div class="section" style="margin-top:22px"><h2>AI Assistant</h2></div>
-<div class="ai"><b>Personal AI Assistant</b><p>In V2, tasks are stored on your iPhone. Next we'll connect this assistant to your FastAPI/RAG backend so your conversations and project knowledge become available here.</p><button class="btn" onclick="alert('AI backend connection is the next step.')">Open AI Assistant</button></div>
+<div class="ai"><b>Personal AI Assistant</b><p>Ask your Personal AI anything. The dashboard is now connected to your FastAPI backend.</p><button class="btn" onclick="show('chat')">Open AI Assistant</button></div>
 </main>
-<nav><div class="active"><span>⌂</span>Home</div><div><span>✓</span>Tasks</div><div><span>💬</span>AI Chat</div><div><span>▥</span>Analytics</div><div><span>•••</span>More</div></nav>
+</section>
+
+<section id="chat" class="hidden">
+<header><div class="small">Your Personal AI</div><div class="title">AI Assistant 🤖</div><div class="quote">Connected to your Personal AI backend.</div></header>
+<main>
+<div class="chatbox">
+<div class="chiprow">
+<button class="chip" onclick="quick('What is my current project progress?')">Project progress</button>
+<button class="chip" onclick="quick('Explain RAG retrieval')">Explain RAG</button>
+<button class="chip" onclick="quick('Give me an interview question')">Interview</button>
 </div>
+<div id="messages" class="messages"></div>
+<div id="status" class="status">Backend: ready</div>
+<div class="composer"><input id="question" placeholder="Ask anything..." onkeydown="if(event.key==='Enter')ask()"><button class="send" onclick="ask()">➤</button></div>
+</div>
+</main>
+</section>
+
+<nav>
+<button id="navHome" class="active" onclick="show('home')"><span>⌂</span>Home</button>
+<button onclick="show('home')"><span>✓</span>Tasks</button>
+<button id="navChat" onclick="show('chat')"><span>💬</span>AI Chat</button>
+<button onclick="alert('Analytics module is next.')"><span>▥</span>Analytics</button>
+<button onclick="alert('More modules are next.')"><span>•••</span>More</button>
+</nav>
+</div>
+
 <script>
+const API_BASE_URL="https://personal-dashboard-82yx.onrender.com";
+
 const defaultTasks=[
- {id:1,title:"Continue RAG chat history",cat:"AI Project",done:false},
- {id:2,title:"Go interview preparation",cat:"Career",done:false},
- {id:3,title:"Review resort bookings",cat:"Business",done:false},
- {id:4,title:"Review today's work tasks",cat:"Work",done:false},
- {id:5,title:"Study one AI concept",cat:"Learning",done:false},
- {id:6,title:"Plan next Historic_ai topic",cat:"YouTube",done:false}
+{id:1,title:"Continue Personal AI project",cat:"AI Project",done:false},
+{id:2,title:"Go interview preparation",cat:"Career",done:false},
+{id:3,title:"Review resort bookings",cat:"Business",done:false},
+{id:4,title:"Review today's work tasks",cat:"Work",done:false},
+{id:5,title:"Study one AI concept",cat:"Learning",done:false},
+{id:6,title:"Plan next Historic_ai topic",cat:"YouTube",done:false}
 ];
 let tasks=JSON.parse(localStorage.getItem("my_dashboard_tasks")||"null")||defaultTasks;
 function save(){localStorage.setItem("my_dashboard_tasks",JSON.stringify(tasks))}
@@ -57,16 +84,39 @@ function render(){
  const list=document.getElementById("tasks");list.innerHTML="";
  tasks.forEach(t=>{
   const d=document.createElement("div");d.className="task"+(t.done?" done":"");
-  d.innerHTML='<button class="check '+(t.done?'done':'')+'" aria-label="complete">'+(t.done?'✓':'')+'</button><div><div class="task-title"></div><small></small></div>';
+  d.innerHTML='<button class="check '+(t.done?'done':'')+'">'+(t.done?'✓':'')+'</button><div><div class="task-title"></div><small></small></div>';
   d.querySelector(".task-title").textContent=t.title;d.querySelector("small").textContent=t.cat;
   d.querySelector(".check").onclick=()=>{t.done=!t.done;save();render()};list.appendChild(d);
  });
  const done=tasks.filter(t=>t.done).length;document.getElementById("total").textContent=tasks.length;
  document.getElementById("completed").textContent=done;document.getElementById("progress").textContent=tasks.length-done;
 }
-function addTask(){const title=prompt("What task do you want to add?");if(!title)return;const cat=prompt("Category (Work / AI Project / Resort / Finance / Learning / YouTube)","Personal")||"Personal";tasks.push({id:Date.now(),title,cat,done:false});save();render()}
+function addTask(){const title=prompt("What task do you want to add?");if(!title)return;const cat=prompt("Category","Personal")||"Personal";tasks.push({id:Date.now(),title,cat,done:false});save();render()}
 function clearCompleted(){tasks=tasks.filter(t=>!t.done);save();render()}
-const h=new Date().getHours();document.getElementById("greeting").textContent=h<12?"Good morning 👋":h<18?"Good afternoon 👋":"Good evening 👋";render();
+function show(id){
+ document.querySelectorAll("section").forEach(s=>s.classList.add("hidden"));document.getElementById(id).classList.remove("hidden");
+ document.getElementById("navHome").classList.toggle("active",id==="home");document.getElementById("navChat").classList.toggle("active",id==="chat");
+}
+function addBubble(text,type){const d=document.createElement("div");d.className="bubble "+type;d.textContent=text;document.getElementById("messages").appendChild(d);document.getElementById("messages").scrollTop=999999}
+function quick(q){document.getElementById("question").value=q;ask()}
+async function ask(){
+ const input=document.getElementById("question"),q=input.value.trim();if(!q)return;
+ addBubble(q,"user");input.value="";
+ const status=document.getElementById("status");
+ status.textContent="Thinking…";
+ try{
+  const r=await fetch(API_BASE_URL.replace(/\/$/,"")+"/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question:q})});
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  const data=await r.json();
+  const answer=data.answer??data.response??data.result??data.message??JSON.stringify(data);
+  addBubble(String(answer),"assistant");status.textContent="Backend: connected";
+ }catch(e){
+  addBubble("I couldn't reach the AI backend. Please wait a few seconds and try again. If it still fails, check the Render service status.","assistant");
+  status.textContent="Backend error: "+e.message;
+ }
+}
+const h=new Date().getHours();document.getElementById("greeting").textContent=h<12?"Good morning 👋":h<18?"Good afternoon 👋":"Good evening 👋";
+render();
 </script>
 </body>
 </html>
