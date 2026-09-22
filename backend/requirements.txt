@@ -1,5 +1,7 @@
-fastapi
-uvicorn[standard]
-pydantic
-groq
-psycopg[binary]
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+groq>=0.13.0,<1.0
+psycopg[binary]>=3.2.3,<4.0
+python-multipart>=0.0.20,<1.0
+pypdf>=5.1.0,<6.0
+python-docx>=1.1.2,<2.0
