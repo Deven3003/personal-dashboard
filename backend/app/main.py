@@ -13,10 +13,70 @@ from pydantic import BaseModel
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 
+try:
+    import numpy as np
+    from fastembed import TextEmbedding
+except ImportError:
+    np = None
+    TextEmbedding = None
+
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+EMBEDDING_DIM = 384
+_embedding_model = None
+
+
+def get_embedding_model():
+    global _embedding_model
+    if TextEmbedding is None or np is None:
+        raise RuntimeError("Semantic embedding dependencies are not installed")
+    if _embedding_model is None:
+        _embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
+    return _embedding_model
+
+
+def normalize_vector(vector):
+    arr = np.asarray(vector, dtype=np.float32)
+    norm = float(np.linalg.norm(arr))
+    if norm == 0:
+        return arr.tolist()
+    return (arr / norm).astype(np.float32).tolist()
+
+
+def embed_passages(texts):
+    if not texts:
+        return []
+    model = get_embedding_model()
+    if hasattr(model, "passage_embed"):
+        vectors = model.passage_embed(texts)
+    else:
+        vectors = model.embed([f"passage: {t}" for t in texts])
+    return [normalize_vector(v) for v in vectors]
+
+
+def embed_query(text):
+    model = get_embedding_model()
+    if hasattr(model, "query_embed"):
+        vector = next(model.query_embed([text]))
+    else:
+        vector = next(model.embed([f"query: {text}"]))
+    return normalize_vector(vector)
+
+
+def cosine_similarity(a, b):
+    if np is None:
+        return 0.0
+    av = np.asarray(a, dtype=np.float32)
+    bv = np.asarray(b, dtype=np.float32)
+    denom = float(np.linalg.norm(av) * np.linalg.norm(bv))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(av, bv) / denom)
+
+
 app = FastAPI(
     title="Personal AI Dashboard API",
-    version="4.0.0",
-    description="Personal AI backend with Groq, persistent conversations, and multi-document retrieval",
+    version="5.0.0",
+    description="Personal AI backend with Groq, persistent conversations, multi-document semantic vector retrieval, and chat history",
 )
 
 app.add_middleware(
@@ -81,6 +141,8 @@ def init_db():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            conn.execute("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding JSONB")
+            conn.execute("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding_model TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_document_id ON document_chunks(document_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_created_at ON documents(created_at DESC)")
             conn.commit()
@@ -122,7 +184,9 @@ def health():
         "database": "postgres",
         "database_configured": db_configured,
         "database_connected": db_ok,
-        "document_retrieval": "enabled" if db_ok else "waiting_for_database",
+        "document_retrieval": "semantic-vector" if db_ok and TextEmbedding is not None else ("waiting_for_database" if not db_ok else "dependencies_missing"),
+        "embedding_model": EMBEDDING_MODEL_NAME,
+        "embedding_dimensions": EMBEDDING_DIM,
     }
 
 
@@ -189,6 +253,20 @@ def upload_document(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="No usable text could be extracted from this file.")
     chunks = split_text(text)
     document_id = str(uuid.uuid4())
+
+    # Generate semantic vectors before writing the document so a successful
+    # upload is normally immediately searchable by meaning.
+    embeddings = None
+    embedding_warning = None
+    try:
+        embeddings = embed_passages(chunks)
+        if len(embeddings) != len(chunks):
+            raise RuntimeError("Embedding count did not match chunk count")
+    except Exception as exc:
+        # Keep the document usable through the previous keyword fallback.
+        embedding_warning = f"Semantic embedding unavailable: {type(exc).__name__}"
+        embeddings = [None] * len(chunks)
+
     try:
         with get_db() as conn:
             conn.execute(
@@ -197,8 +275,14 @@ def upload_document(file: UploadFile = File(...)):
             )
             for idx, chunk in enumerate(chunks):
                 conn.execute(
-                    "INSERT INTO document_chunks (id, document_id, chunk_index, content) VALUES (%s, %s, %s, %s)",
-                    (str(uuid.uuid4()), document_id, idx, chunk),
+                    """INSERT INTO document_chunks
+                       (id, document_id, chunk_index, content, embedding, embedding_model)
+                       VALUES (%s, %s, %s, %s, %s::jsonb, %s)""",
+                    (
+                        str(uuid.uuid4()), document_id, idx, chunk,
+                        json.dumps(embeddings[idx]) if embeddings[idx] is not None else None,
+                        EMBEDDING_MODEL_NAME if embeddings[idx] is not None else None,
+                    ),
                 )
             conn.commit()
     except Exception as exc:
@@ -209,7 +293,9 @@ def upload_document(file: UploadFile = File(...)):
         "size_bytes": len(raw),
         "chunks": len(chunks),
         "status": "indexed",
-        "retrieval": "keyword-overlap-v1",
+        "retrieval": "semantic-vector-v2" if embeddings and embeddings[0] is not None else "keyword-fallback-v1",
+        "embedding_model": EMBEDDING_MODEL_NAME if embeddings and embeddings[0] is not None else None,
+        "warning": embedding_warning,
     }
 
 
@@ -219,7 +305,8 @@ def list_documents():
         with get_db() as conn:
             rows = conn.execute("""
                 SELECT d.id, d.filename, d.content_type, d.size_bytes, d.created_at,
-                       COUNT(c.id) AS chunk_count
+                       COUNT(c.id) AS chunk_count,
+                       COUNT(c.embedding) AS embedded_count
                 FROM documents d
                 LEFT JOIN document_chunks c ON c.document_id = d.id
                 GROUP BY d.id
@@ -230,9 +317,46 @@ def list_documents():
     return {"documents": [
         {
             "id": r[0], "filename": r[1], "content_type": r[2], "size_bytes": r[3],
-            "created_at": r[4].isoformat(), "chunks": r[5]
+            "created_at": r[4].isoformat(), "chunks": r[5], "embedded_chunks": r[6],
+            "semantic_indexed": r[5] > 0 and r[5] == r[6],
         } for r in rows
     ]}
+
+
+@app.post("/documents/reindex")
+def reindex_documents():
+    """Generate semantic embeddings for chunks created by the earlier keyword-only version."""
+    try:
+        with get_db() as conn:
+            rows = conn.execute("""
+                SELECT id, content FROM document_chunks
+                WHERE embedding IS NULL
+                ORDER BY created_at ASC
+            """).fetchall()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+
+    if not rows:
+        return {"status": "already_indexed", "embedded_chunks": 0, "embedding_model": EMBEDDING_MODEL_NAME}
+
+    total = 0
+    batch_size = 32
+    try:
+        with get_db() as conn:
+            for start in range(0, len(rows), batch_size):
+                batch = rows[start:start + batch_size]
+                vectors = embed_passages([r[1] for r in batch])
+                for (chunk_id, _), vector in zip(batch, vectors):
+                    conn.execute(
+                        "UPDATE document_chunks SET embedding=%s::jsonb, embedding_model=%s WHERE id=%s",
+                        (json.dumps(vector), EMBEDDING_MODEL_NAME, chunk_id),
+                    )
+                    total += 1
+                conn.commit()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Semantic indexing failed: {type(exc).__name__}")
+
+    return {"status": "reindexed", "embedded_chunks": total, "embedding_model": EMBEDDING_MODEL_NAME}
 
 
 @app.delete("/documents/{document_id}")
@@ -249,28 +373,67 @@ def delete_document(document_id: str):
 
 
 def retrieve_document_context(question: str, limit: int = 5):
+    """Semantic cosine retrieval over stored 384D passage embeddings.
+
+    For chunks uploaded before semantic RAG was introduced, fall back to the
+    original keyword-overlap retrieval until /documents/reindex is run.
+    """
+    if not question.strip():
+        return []
+    try:
+        query_vector = embed_query(question)
+        with get_db() as conn:
+            rows = conn.execute("""
+                SELECT d.filename, c.content, c.embedding
+                FROM document_chunks c
+                JOIN documents d ON d.id = c.document_id
+                WHERE c.embedding IS NOT NULL
+            """).fetchall()
+    except Exception:
+        rows = []
+        query_vector = None
+
+    if rows and query_vector is not None:
+        scored = []
+        for filename, content, embedding in rows:
+            try:
+                score = cosine_similarity(query_vector, embedding)
+            except Exception:
+                continue
+            scored.append((score, filename, content))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [
+            {"filename": f, "content": c, "score": round(float(s), 4), "retrieval": "semantic-vector"}
+            for s, f, c in scored[:limit]
+        ]
+
+    # Backward-compatible keyword fallback for legacy/unembedded chunks.
     q_tokens = tokenize(question)
     if not q_tokens:
         return []
     try:
         with get_db() as conn:
-            rows = conn.execute("""
+            legacy_rows = conn.execute("""
                 SELECT d.filename, c.content
                 FROM document_chunks c
                 JOIN documents d ON d.id = c.document_id
+                WHERE c.embedding IS NULL
                 ORDER BY c.created_at DESC
             """).fetchall()
     except Exception:
         return []
     scored = []
-    for filename, content in rows:
+    for filename, content in legacy_rows:
         tokens = tokenize(content)
         overlap = len(q_tokens & tokens)
         if overlap:
             score = overlap / max(1, len(q_tokens))
             scored.append((score, filename, content))
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [{"filename": f, "content": c, "score": round(s, 3)} for s, f, c in scored[:limit]]
+    return [
+        {"filename": f, "content": c, "score": round(s, 3), "retrieval": "keyword-fallback"}
+        for s, f, c in scored[:limit]
+    ]
 
 
 def call_ai(messages, document_context=None):
@@ -281,7 +444,7 @@ Be helpful, practical, concise, and clear. Maintain continuity with conversation
 When document context is provided, answer using it when relevant. Do not invent facts from documents.
 If the supplied document context does not contain the answer, say that the available documents do not provide enough information, then answer generally only if useful.
 When using document context, mention the source filename naturally in the answer.
-Persistent conversation history and multi-document retrieval are enabled."""
+Persistent conversation history and semantic vector document retrieval are enabled. When document context includes retrieval metadata, prefer the highest-scoring relevant passages."""
     if document_context:
         context_text = "\n\n".join(
             f"SOURCE: {x['filename']}\n{x['content']}" for x in document_context
@@ -370,6 +533,8 @@ def conversation_ask(conversation_id: str, request: QuestionRequest):
         "conversation_id": conversation_id, "answer": answer, "status": "success",
         "ai_provider": "groq", "model": model, "message_count": len(messages),
         "document_sources": [x["filename"] for x in context],
+        "retrieval_mode": context[0].get("retrieval") if context else ("disabled" if not request.use_documents else "no_match"),
+        "retrieval_scores": [x.get("score") for x in context],
     }
 
 
