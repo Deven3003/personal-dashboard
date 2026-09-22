@@ -208,6 +208,9 @@ def upload_document(file: UploadFile = File(...)):
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not extract text: {type(exc).__name__}")
+    # PostgreSQL text fields reject NUL bytes. Some PDFs contain embedded NULs.
+    # Remove them before chunking/storing so otherwise-valid documents can be indexed.
+    text = text.replace("\x00", "")
     text = text.strip()
     if len(text) < 20:
         raise HTTPException(status_code=400, detail="No usable text could be extracted from this file.")
@@ -235,7 +238,7 @@ def upload_document(file: UploadFile = File(...)):
                 )
             conn.commit()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}: {str(exc)[:180]}")
     return {
         "id": document_id,
         "filename": filename,
@@ -262,7 +265,7 @@ def list_documents():
                 ORDER BY d.created_at DESC
             """).fetchall()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}: {str(exc)[:180]}")
     return {"documents": [
         {
             "id": r[0], "filename": r[1], "content_type": r[2], "size_bytes": r[3],
@@ -284,7 +287,7 @@ def document_index_payload():
                 ORDER BY created_at ASC
             """).fetchall()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}: {str(exc)[:180]}")
     return {
         "embedding_model": EMBEDDING_MODEL_NAME,
         "embedding_dimensions": EMBEDDING_DIM,
@@ -321,7 +324,7 @@ def save_document_embeddings(request: EmbeddingBatchRequest):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}: {str(exc)[:180]}")
     return {"status": "saved", "saved": saved, "embedding_model": EMBEDDING_MODEL_NAME}
 
 
@@ -332,7 +335,7 @@ def reindex_documents():
         with get_db() as conn:
             row = conn.execute("SELECT COUNT(*) FROM document_chunks WHERE embedding IS NULL").fetchone()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}: {str(exc)[:180]}")
     pending = int(row[0])
     return {
         "status": "already_indexed" if pending == 0 else "needs_client_indexing",
@@ -349,7 +352,7 @@ def delete_document(document_id: str):
             cur = conn.execute("DELETE FROM documents WHERE id = %s", (document_id,))
             conn.commit()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}: {str(exc)[:180]}")
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Document not found")
     return {"status": "deleted", "id": document_id}
@@ -445,7 +448,7 @@ def read_conversation(conversation_id):
                 FROM conversations WHERE id = %s
             """, (conversation_id,)).fetchone()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}: {str(exc)[:180]}")
     if not row:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"id": row[0], "title": row[1], "messages": row[2], "created_at": row[3].isoformat(), "updated_at": row[4].isoformat()}
@@ -460,7 +463,7 @@ def create_conversation(request: ConversationCreate):
             conn.execute("INSERT INTO conversations (id, title, messages) VALUES (%s, %s, %s::jsonb)", (conversation_id, title, json.dumps([])))
             conn.commit()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}: {str(exc)[:180]}")
     return read_conversation(conversation_id)
 
 
@@ -473,7 +476,7 @@ def list_conversations():
                 FROM conversations ORDER BY updated_at DESC
             """).fetchall()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}: {str(exc)[:180]}")
     return {"conversations": [
         {"id": r[0], "title": r[1], "created_at": r[2].isoformat(), "updated_at": r[3].isoformat(), "message_count": r[4]}
         for r in rows
