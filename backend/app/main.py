@@ -390,6 +390,53 @@ def relevance_label(score, rank):
     return "related"
 
 
+def is_date_question(question: str) -> bool:
+    q = question.lower()
+    return any(term in q for term in (
+        "expire", "expires", "expiry", "expiration", "renew", "renewal",
+        "valid", "validity", "deadline", "due date", "upcoming", "soon",
+        "when does", "when will", "end date", "policy end", "coverage period",
+    ))
+
+
+def temporal_chunk_score(content: str, semantic_score: float, today=None):
+    """Score date-bearing chunks for expiry/validity questions.
+
+    Semantic similarity alone can select an older certificate/quote that contains
+    a historical policy period. For date questions, explicit end/expiry labels
+    and the date's relation to today are stronger signals.
+    """
+    today = today or datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+    lower = content.lower()
+    anchors = (
+        "policy end date", "end date", "expiry date", "expiry", "expires",
+        "expiration", "valid until", "validity", "policy period",
+        "coverage period", "period of insurance", "renewal date", "renewal",
+    )
+    anchor_hits = sum(1 for a in anchors if a in lower)
+    dates = extract_document_dates(content)
+    if not anchor_hits or not dates:
+        return None
+
+    best = None
+    for found in dates:
+        value = found["date"]
+        if value >= today:
+            days = (value - today).days
+            # Prefer upcoming dates, with a strong bonus for explicit end/expiry labels.
+            proximity = max(0.0, 2.8 - min(days, 365) / 365 * 1.8)
+            status_bonus = 3.0
+        else:
+            days_past = (today - value).days
+            proximity = max(0.0, 0.8 - min(days_past, 730) / 730 * 0.6)
+            status_bonus = 0.0
+        score = float(semantic_score or 0.0) * 0.45 + anchor_hits * 1.25 + status_bonus + proximity
+        candidate = (score, found)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    return best
+
+
 def retrieve_document_context(question: str, query_vector=None, limit: int = MAX_RETRIEVAL, document_ids=None):
     if not question.strip():
         return []
@@ -423,6 +470,46 @@ def retrieve_document_context(question: str, query_vector=None, limit: int = MAX
             except Exception:
                 continue
             scored.append((score, chunk_id, document_id, filename, content, page_number, chunk_index))
+
+        # Date-sensitive questions get a deterministic retrieval path. This avoids
+        # selecting an older historical policy period merely because its wording is
+        # semantically similar to the question.
+        if is_date_question(question):
+            today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+            temporal = []
+            for score, chunk_id, document_id, filename, content, page_number, chunk_index in scored:
+                ranked = temporal_chunk_score(content, score, today=today)
+                if ranked is not None:
+                    temporal.append((ranked[0], score, chunk_id, document_id, filename, content, page_number, chunk_index, ranked[1]))
+
+            if temporal:
+                # Keep the strongest date-bearing chunk from each document first,
+                # then allow additional supporting chunks when useful.
+                temporal.sort(key=lambda x: x[0], reverse=True)
+                results = []
+                per_doc = {}
+                for temporal_score, semantic_score, chunk_id, document_id, filename, content, page_number, chunk_index, found in temporal:
+                    if per_doc.get(document_id, 0) >= 2:
+                        continue
+                    per_doc[document_id] = per_doc.get(document_id, 0) + 1
+                    rank = len(results) + 1
+                    results.append({
+                        "chunk_id": chunk_id,
+                        "document_id": document_id,
+                        "filename": filename,
+                        "content": content,
+                        "score": round(float(semantic_score), 4),
+                        "relevance": relevance_label(semantic_score, rank),
+                        "page_number": page_number,
+                        "chunk_index": chunk_index,
+                        "retrieval": "semantic-vector-temporal",
+                        "temporal_date": found["raw"],
+                    })
+                    if len(results) >= limit:
+                        break
+                if results:
+                    return results
+
         scored.sort(key=lambda x: x[0], reverse=True)
         results = []
         per_doc = {}
@@ -567,7 +654,7 @@ def build_reasoning_validation(question, document_context):
     lines = [f"VALIDATION DATE (India): {today.strftime('%d %B %Y')}"]
 
     if date_intent:
-        expiry_terms = ("expiry", "expires", "expiration", "expire", "valid until", "validity", "renewal", "renew")
+        expiry_terms = ("expiry", "expires", "expiration", "expire", "expiry date", "end date", "policy end", "valid until", "validity", "policy period", "coverage period", "period of insurance", "renewal", "renew")
         candidates = []
         for item in document_context:
             for found in extract_document_dates(item.get("content", "")):
@@ -586,7 +673,7 @@ def build_reasoning_validation(question, document_context):
                     status = f"FUTURE — { (value - today).days } days from today"
                 page = f"page {item.get('page_number')}" if item.get("page_number") else f"chunk {int(item.get('chunk_index', 0)) + 1}"
                 lines.append(f"- {item['filename']} ({page}): {found['raw']} => {status}")
-            lines.append("RULE: If a document date is PAST, never describe it as a future/upcoming expiry. Say that the date has already passed and clearly distinguish that from any later renewal not present in the documents.")
+            lines.append("RULE: For an expiry question, prefer an explicitly labeled Policy End Date / Expiry Date / End Date over a historical date appearing in a certificate, receipt, or older coverage period. If multiple dates exist for the same policy, use the explicitly labeled end date and explain conflicting historical dates. If a document date is PAST, never describe it as a future/upcoming expiry. Say that the date has already passed and clearly distinguish that from any later renewal not present in the documents.")
         else:
             lines.append("No machine-validated expiry/validity date was found near date phrases in the retrieved document context. Do not invent one.")
 
