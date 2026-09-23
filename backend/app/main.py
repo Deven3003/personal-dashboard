@@ -2,6 +2,9 @@ import json
 import os
 import re
 import uuid
+import logging
+import time
+from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 
@@ -15,7 +18,15 @@ from docx import Document as DocxDocument
 
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "Xenova/all-MiniLM-L6-v2")
 EMBEDDING_DIM = 384
-MAX_RETRIEVAL = 6
+MAX_RETRIEVAL = 8
+MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_QUESTION_CHARS = 4000
+MAX_HISTORY_MESSAGES = 12
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+logger = logging.getLogger("personal_dashboard")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+_rate_buckets = defaultdict(deque)
+
 
 
 def normalize_vector(vector):
@@ -34,7 +45,7 @@ def cosine_similarity(a, b):
 
 app = FastAPI(
     title="Personal AI Dashboard API",
-    version="8.0.0",
+    version="12.0.0",
     description="Personal AI backend with persistent conversations, semantic RAG, source citations, page references, multi-document retrieval, and document-scoped conversations.",
 )
 app.add_middleware(
@@ -45,12 +56,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def production_middleware(request, call_next):
+    started = time.perf_counter()
+    client = request.client.host if request.client else "unknown"
+    bucket = _rate_buckets[client]
+    now = time.time()
+    while bucket and now - bucket[0] > 60:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT_PER_MINUTE:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded. Please try again shortly."})
+    bucket.append(now)
+    request_id = str(uuid.uuid4())
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("Unhandled request error request_id=%s path=%s", request_id, request.url.path)
+        from fastapi.responses import JSONResponse
+        response = JSONResponse(status_code=500, content={"detail": "Internal server error", "request_id": request_id})
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/health") else response.headers.get("Cache-Control", "")
+    logger.info("%s %s -> %s %.0fms request_id=%s", request.method, request.url.path, response.status_code, (time.perf_counter()-started)*1000, request_id)
+    return response
+
 
 class QuestionRequest(BaseModel):
     question: str
     use_documents: bool = True
     query_embedding: list[float] | None = None
     document_ids: list[str] | None = None
+    agent_mode: bool = False
 
 
 class ConversationCreate(BaseModel):
@@ -94,7 +133,8 @@ def init_db():
                     title TEXT NOT NULL DEFAULT 'New conversation',
                     messages JSONB NOT NULL DEFAULT '[]'::jsonb,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    summary TEXT NOT NULL DEFAULT ''
                 )
             """)
             conn.execute("""
@@ -116,6 +156,7 @@ def init_db():
                 )
             """)
             conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS document_ids JSONB NOT NULL DEFAULT '[]'::jsonb")
+            conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT ''")
             conn.execute("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding JSONB")
             conn.execute("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding_model TEXT")
             conn.execute("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS page_number INTEGER")
@@ -136,10 +177,10 @@ def root():
     return {
         "service": "personal-ai-dashboard",
         "status": "online",
-        "version": "8.0.0",
+        "version": "12.0.0",
         "features": [
             "groq-ai", "persistent-conversations", "semantic-vector-retrieval",
-            "source-citations", "page-references", "multi-document-qa", "document-scoped-conversations", "temporal-reasoning", "numeric-validation"
+            "source-citations", "page-references", "multi-document-qa", "document-scoped-conversations", "temporal-reasoning", "numeric-validation", "conversation-memory", "document-intelligence", "agentic-workflows", "production-hardening"
         ],
     }
 
@@ -170,6 +211,10 @@ def health():
         "embedding_generation": "browser-side-free",
         "citations": "source-and-page-aware",
         "multi_document": True,
+        "conversation_memory": True,
+        "document_intelligence": True,
+        "agentic_workflows": True,
+        "production_hardening": True,
     }
 
 
@@ -238,7 +283,7 @@ def build_chunks(parts):
 @app.post("/documents")
 def upload_document(file: UploadFile = File(...)):
     raw = file.file.read()
-    max_bytes = 10 * 1024 * 1024
+    max_bytes = MAX_FILE_BYTES
     if len(raw) > max_bytes:
         raise HTTPException(status_code=413, detail="File is too large. Maximum size is 10 MB.")
     filename = (file.filename or "document").strip()
@@ -437,139 +482,120 @@ def temporal_chunk_score(content: str, semantic_score: float, today=None):
     return best
 
 
+def _date_label_weight(context_lower: str) -> float:
+    weights = {
+        "policy end date": 12.0, "expiry date": 11.0, "expiration date": 11.0,
+        "policy expiry": 10.0, "end date": 9.0, "valid until": 9.0,
+        "valid till": 9.0, "period of insurance": 7.0, "coverage period": 5.0,
+        "policy period": 5.0, "renewal date": 6.0,
+        "policy start date": -6.0, "start date": -5.0, "receipt date": -8.0,
+        "issue date": -6.0, "issued on": -6.0, "transaction date": -5.0,
+    }
+    return max((w for label, w in weights.items() if label in context_lower), default=0.0)
+
+
+def _date_candidates(rows, today):
+    candidates=[]
+    for score, chunk_id, document_id, filename, content, page_number, chunk_index in rows:
+        for found in extract_document_dates(content):
+            context_lower=found["context"].lower()
+            label_weight=_date_label_weight(context_lower)
+            if label_weight == 0 and not any(k in content.lower() for k in ("expire", "expiry", "end date", "validity", "coverage period", "policy period")):
+                continue
+            value=found["date"]
+            if value > today:
+                temporal=8.0 + max(0.0, 4.0 - min((value-today).days, 730)/180)
+            elif value == today:
+                temporal=9.0
+            else:
+                temporal=max(-4.0, -1.0 - min((today-value).days, 1095)/365)
+            total=label_weight*2.2 + temporal + max(0.0, score or 0.0)*0.6
+            candidates.append((total, value, score, chunk_id, document_id, filename, content, page_number, chunk_index, found))
+    return sorted(candidates, key=lambda x:(x[0], x[1]), reverse=True)
+
+
 def retrieve_document_context(question: str, query_vector=None, limit: int = MAX_RETRIEVAL, document_ids=None):
     if not question.strip():
         return []
-    selected = [x for x in (document_ids or []) if x]
-    rows = []
+    selected=[x for x in (document_ids or []) if x]
+    rows=[]
     try:
         with get_db() as conn:
             if selected:
-                rows = conn.execute("""
+                rows=conn.execute("""
                     SELECT c.id, c.document_id, d.filename, c.content, c.embedding, c.page_number, c.chunk_index
-                    FROM document_chunks c
-                    JOIN documents d ON d.id = c.document_id
-                    WHERE c.embedding IS NOT NULL AND c.document_id = ANY(%s)
+                    FROM document_chunks c JOIN documents d ON d.id=c.document_id
+                    WHERE c.embedding IS NOT NULL AND c.document_id=ANY(%s)
                 """, (selected,)).fetchall()
             else:
-                rows = conn.execute("""
+                rows=conn.execute("""
                     SELECT c.id, c.document_id, d.filename, c.content, c.embedding, c.page_number, c.chunk_index
-                    FROM document_chunks c
-                    JOIN documents d ON d.id = c.document_id
+                    FROM document_chunks c JOIN documents d ON d.id=c.document_id
                     WHERE c.embedding IS NOT NULL
                 """).fetchall()
-    except Exception:
-        rows = []
+    except Exception as exc:
+        logger.warning("semantic retrieval failed: %s", type(exc).__name__)
+        rows=[]
 
+    scored=[]
     if rows and query_vector:
-        qv = normalize_vector(query_vector)
-        scored = []
+        qv=normalize_vector(query_vector)
         for chunk_id, document_id, filename, content, embedding, page_number, chunk_index in rows:
-            try:
-                score = cosine_similarity(qv, embedding)
-            except Exception:
-                continue
+            try: score=cosine_similarity(qv, embedding)
+            except Exception: continue
             scored.append((score, chunk_id, document_id, filename, content, page_number, chunk_index))
 
-        # Date-sensitive questions get a deterministic retrieval path. This avoids
-        # selecting an older historical policy period merely because its wording is
-        # semantically similar to the question.
         if is_date_question(question):
-            today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
-            temporal = []
-            for score, chunk_id, document_id, filename, content, page_number, chunk_index in scored:
-                ranked = temporal_chunk_score(content, score, today=today)
-                if ranked is not None:
-                    temporal.append((ranked[0], score, chunk_id, document_id, filename, content, page_number, chunk_index, ranked[1]))
+            today=datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+            candidates=_date_candidates(scored, today)
+            if candidates:
+                results=[]; per_doc=defaultdict(int); seen_dates=set()
+                for total, value, sem, cid, did, fn, content, page, ci, found in candidates:
+                    # Prefer one authoritative date per document, then one supporting chunk.
+                    if per_doc[did]>=2: continue
+                    key=(did, value, found["raw"])
+                    if key in seen_dates: continue
+                    seen_dates.add(key); per_doc[did]+=1
+                    results.append({"chunk_id":cid,"document_id":did,"filename":fn,"content":content,
+                                    "score":round(float(sem or 0),4),"relevance":relevance_label(sem, len(results)+1),
+                                    "page_number":page,"chunk_index":ci,"retrieval":"semantic-vector-temporal",
+                                    "temporal_date":found["raw"],"temporal_rank":round(total,3)})
+                    if len(results)>=limit: break
+                if results: return results
 
-            if temporal:
-                # Keep the strongest date-bearing chunk from each document first,
-                # then allow additional supporting chunks when useful.
-                temporal.sort(key=lambda x: x[0], reverse=True)
-                results = []
-                per_doc = {}
-                for temporal_score, semantic_score, chunk_id, document_id, filename, content, page_number, chunk_index, found in temporal:
-                    if per_doc.get(document_id, 0) >= 2:
-                        continue
-                    per_doc[document_id] = per_doc.get(document_id, 0) + 1
-                    rank = len(results) + 1
-                    results.append({
-                        "chunk_id": chunk_id,
-                        "document_id": document_id,
-                        "filename": filename,
-                        "content": content,
-                        "score": round(float(semantic_score), 4),
-                        "relevance": relevance_label(semantic_score, rank),
-                        "page_number": page_number,
-                        "chunk_index": chunk_index,
-                        "retrieval": "semantic-vector-temporal",
-                        "temporal_date": found["raw"],
-                    })
-                    if len(results) >= limit:
-                        break
-                if results:
-                    return results
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        results = []
-        per_doc = {}
-        for score, chunk_id, document_id, filename, content, page_number, chunk_index in scored:
-            # Diversify multi-document retrieval while still allowing the strongest source to dominate.
-            if per_doc.get(document_id, 0) >= 3:
-                continue
-            per_doc[document_id] = per_doc.get(document_id, 0) + 1
-            rank = len(results) + 1
-            results.append({
-                "chunk_id": chunk_id,
-                "document_id": document_id,
-                "filename": filename,
-                "content": content,
-                "score": round(float(score), 4),
-                "relevance": relevance_label(score, rank),
-                "page_number": page_number,
-                "chunk_index": chunk_index,
-                "retrieval": "semantic-vector",
-            })
-            if len(results) >= limit:
-                break
+        scored.sort(key=lambda x:x[0], reverse=True)
+        results=[]; per_doc=defaultdict(int)
+        for score,cid,did,fn,content,page,ci in scored:
+            if per_doc[did]>=3: continue
+            per_doc[did]+=1
+            results.append({"chunk_id":cid,"document_id":did,"filename":fn,"content":content,
+                            "score":round(float(score),4),"relevance":relevance_label(score,len(results)+1),
+                            "page_number":page,"chunk_index":ci,"retrieval":"semantic-vector"})
+            if len(results)>=limit: break
         return results
 
-    q_tokens = tokenize(question)
-    if not q_tokens:
-        return []
+    q_tokens=tokenize(question)
+    if not q_tokens: return []
     try:
         with get_db() as conn:
             if selected:
-                legacy_rows = conn.execute("""
-                    SELECT c.id, c.document_id, d.filename, c.content, c.page_number, c.chunk_index
-                    FROM document_chunks c
-                    JOIN documents d ON d.id = c.document_id
-                    WHERE c.embedding IS NULL AND c.document_id = ANY(%s)
-                """, (selected,)).fetchall()
+                legacy_rows=conn.execute("""SELECT c.id,c.document_id,d.filename,c.content,c.page_number,c.chunk_index
+                    FROM document_chunks c JOIN documents d ON d.id=c.document_id
+                    WHERE c.embedding IS NULL AND c.document_id=ANY(%s)""", (selected,)).fetchall()
             else:
-                legacy_rows = conn.execute("""
-                    SELECT c.id, c.document_id, d.filename, c.content, c.page_number, c.chunk_index
-                    FROM document_chunks c
-                    JOIN documents d ON d.id = c.document_id
-                    WHERE c.embedding IS NULL
-                """).fetchall()
+                legacy_rows=conn.execute("""SELECT c.id,c.document_id,d.filename,c.content,c.page_number,c.chunk_index
+                    FROM document_chunks c JOIN documents d ON d.id=c.document_id
+                    WHERE c.embedding IS NULL""").fetchall()
     except Exception:
         return []
-    scored = []
-    for chunk_id, document_id, filename, content, page_number, chunk_index in legacy_rows:
-        overlap = len(q_tokens & tokenize(content))
-        if overlap:
-            score = overlap / max(1, len(q_tokens))
-            scored.append((score, chunk_id, document_id, filename, content, page_number, chunk_index))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [
-        {
-            "chunk_id": cid, "document_id": did, "filename": f, "content": c,
-            "score": round(float(s), 3), "relevance": relevance_label(s, i + 1),
-            "page_number": page, "chunk_index": ci, "retrieval": "keyword-fallback"
-        }
-        for i, (s, cid, did, f, c, page, ci) in enumerate(scored[:limit])
-    ]
+    scored=[]
+    for cid,did,fn,content,page,ci in legacy_rows:
+        overlap=len(q_tokens & tokenize(content))
+        if overlap: scored.append((overlap/max(1,len(q_tokens)),cid,did,fn,content,page,ci))
+    scored.sort(reverse=True)
+    return [{"chunk_id":cid,"document_id":did,"filename":fn,"content":content,"score":round(float(sc),3),
+             "relevance":relevance_label(sc,i+1),"page_number":page,"chunk_index":ci,"retrieval":"keyword-fallback"}
+            for i,(sc,cid,did,fn,content,page,ci) in enumerate(scored[:limit])]
 
 
 def source_reference(item, number):
@@ -694,11 +720,83 @@ def build_reasoning_validation(question, document_context):
     return "\n".join(lines)
 
 
+def extract_money_values(text):
+    pattern=re.compile(r"(?:₹|INR|Rs\.?)[\s]*([0-9][0-9,]*(?:\.\d{1,2})?)|\b([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:rupees|INR)\b", re.I)
+    values=[]
+    for m in pattern.finditer(text):
+        raw=next((g for g in m.groups() if g), None)
+        if not raw: continue
+        try:
+            amount=float(raw.replace(',',''))
+            values.append({"raw":m.group(0),"amount":amount,"context":text[max(0,m.start()-70):min(len(text),m.end()+70)].replace('\n',' ')})
+        except ValueError: pass
+    return values
+
+
+def build_document_insights(document_ids=None):
+    selected=[x for x in (document_ids or []) if x]
+    try:
+        with get_db() as conn:
+            if selected:
+                rows=conn.execute("""SELECT c.document_id,d.filename,c.page_number,c.content
+                    FROM document_chunks c JOIN documents d ON d.id=c.document_id WHERE c.document_id=ANY(%s) ORDER BY d.filename,c.chunk_index""", (selected,)).fetchall()
+            else:
+                rows=conn.execute("""SELECT c.document_id,d.filename,c.page_number,c.content
+                    FROM document_chunks c JOIN documents d ON d.id=c.document_id ORDER BY d.filename,c.chunk_index""").fetchall()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database request failed: {type(exc).__name__}")
+    by_doc={}
+    for did,fn,page,content in rows:
+        obj=by_doc.setdefault(did,{"document_id":did,"filename":fn,"dates":[],"amounts":[]})
+        for d in extract_document_dates(content):
+            obj["dates"].append({"raw":d["raw"],"date":d["date"].isoformat(),"page":page,"context":d["context"]})
+        for a in extract_money_values(content):
+            obj["amounts"].append({"raw":a["raw"],"amount":a["amount"],"page":page,"context":a["context"]})
+    return {"documents":list(by_doc.values())}
+
+
+def agent_tools(question, query_vector, document_ids):
+    q=question.lower()
+    tools=[]
+    if any(x in q for x in ("compare","difference","versus","vs","between")): tools.append("compare_documents")
+    if is_date_question(question): tools.append("validate_dates")
+    if any(x in q for x in ("amount","cost","premium","price","total","paid","how much","calculate","difference")): tools.append("validate_numbers")
+    tools.append("semantic_retrieval")
+    context=retrieve_document_context(question, query_vector, MAX_RETRIEVAL, document_ids)
+    validation=build_reasoning_validation(question,context)
+    trace=[{"tool":t,"status":"completed"} for t in tools]
+    return context,validation,trace
+
+
+def conversation_prompt_context(conversation):
+    msgs=conversation.get("messages") or []
+    summary=conversation.get("summary") or ""
+    recent=msgs[-MAX_HISTORY_MESSAGES:]
+    out=[]
+    if summary: out.append({"role":"system","content":"Conversation memory summary:\n"+summary})
+    out.extend({"role":m.get("role"),"content":m.get("content","")} for m in recent if m.get("role") in ("user","assistant"))
+    return out
+
+
+def maybe_update_summary(conversation_id, messages):
+    if len(messages)<16 or len(messages)%8!=0: return
+    try:
+        client=get_groq_client(); model=os.getenv("GROQ_MODEL","openai/gpt-oss-20b")
+        transcript="\n".join(f"{m['role']}: {m['content']}" for m in messages[-20:])
+        c=client.chat.completions.create(model=model,messages=[
+            {"role":"system","content":"Summarize this conversation for future context. Keep decisions, document references, user goals, unresolved questions, and important facts. Do not invent."},
+            {"role":"user","content":transcript}],temperature=0.1,max_completion_tokens=500)
+        summary=c.choices[0].message.content.strip()
+        with get_db() as conn:
+            conn.execute("UPDATE conversations SET summary=%s, updated_at=%s WHERE id=%s",(summary,datetime.now(timezone.utc),conversation_id)); conn.commit()
+    except Exception as exc:
+        logger.warning("memory summary skipped: %s",type(exc).__name__)
+
 def call_ai(messages, document_context=None, reasoning_validation=None):
     client = get_groq_client()
     model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
     system_prompt = """You are Personal AI, the user's private AI assistant inside their Personal Dashboard.
-Be helpful, practical, concise, and clear. Maintain continuity with conversation history.
+Be helpful, practical, concise, and clear. Maintain continuity with conversation history and the supplied conversation-memory summary.
 When document context is provided, answer using it when relevant. Do not invent facts from documents.
 If the supplied document context does not contain the answer, say that the available documents do not provide enough information, then answer generally only if useful.
 Multiple documents may be supplied. Compare them when the user asks for comparison, differences, common points, or a combined answer.
@@ -726,7 +824,7 @@ def read_conversation(conversation_id):
     try:
         with get_db() as conn:
             row = conn.execute("""
-                SELECT id, title, messages, created_at, updated_at, COALESCE(document_ids, '[]'::jsonb)
+                SELECT id, title, messages, created_at, updated_at, COALESCE(document_ids, '[]'::jsonb), COALESCE(summary, '')
                 FROM conversations WHERE id = %s
             """, (conversation_id,)).fetchone()
     except Exception as exc:
@@ -736,7 +834,7 @@ def read_conversation(conversation_id):
     return {
         "id": row[0], "title": row[1], "messages": row[2],
         "created_at": row[3].isoformat(), "updated_at": row[4].isoformat(),
-        "document_ids": row[5] or [],
+        "document_ids": row[5] or [], "summary": row[6] or "",
     }
 
 
@@ -796,60 +894,56 @@ def update_conversation_scope(conversation_id: str, request: ConversationScopeUp
 
 @app.post("/conversations/{conversation_id}/ask")
 def conversation_ask(conversation_id: str, request: QuestionRequest):
-    question = request.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
-    conversation = read_conversation(conversation_id)
-    messages = conversation["messages"] or []
-    messages.append({"role": "user", "content": question})
-    scope = request.document_ids if request.document_ids is not None else conversation.get("document_ids", [])
-    context = retrieve_document_context(question, request.query_embedding, document_ids=scope) if request.use_documents else []
-    reasoning_validation = build_reasoning_validation(question, context)
+    question=request.question.strip()
+    if not question: raise HTTPException(status_code=400, detail="Question cannot be empty")
+    if len(question)>MAX_QUESTION_CHARS: raise HTTPException(status_code=413, detail=f"Question is too long. Maximum is {MAX_QUESTION_CHARS} characters.")
+    conversation=read_conversation(conversation_id)
+    scope=request.document_ids if request.document_ids is not None else conversation.get("document_ids",[])
+    context=[]; validation=None; trace=[]
+    if request.use_documents:
+        context,validation,trace=agent_tools(question,request.query_embedding,scope) if request.agent_mode else (retrieve_document_context(question,request.query_embedding,document_ids=scope),None,[])
+        if validation is None: validation=build_reasoning_validation(question,context)
+    history=conversation_prompt_context(conversation)
+    history.append({"role":"user","content":question})
     try:
-        answer, model = call_ai(messages, context, reasoning_validation)
-        messages.append({"role": "assistant", "content": answer})
-        new_title = conversation["title"] if conversation["title"] != "New conversation" else question[:60]
+        answer,model=call_ai(history,context,validation)
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(status_code=502,detail=f"AI provider request failed: {type(exc).__name__}")
+    sources=[]
+    for i,x in enumerate(context,1):
+        sources.append({"source_number":i,"filename":x["filename"],"document_id":x["document_id"],"page_number":x.get("page_number"),"chunk_index":x.get("chunk_index"),"score":x.get("score"),"relevance":x.get("relevance"),"retrieval":x.get("retrieval")})
+    messages=conversation["messages"] or []
+    messages.append({"role":"user","content":question})
+    messages.append({"role":"assistant","content":answer,"sources":sources,"agent_trace":trace})
+    new_title=conversation["title"] if conversation["title"]!="New conversation" else question[:60]
+    try:
         with get_db() as conn:
-            conn.execute("""
-                UPDATE conversations SET title=%s, messages=%s::jsonb, updated_at=%s WHERE id=%s
-            """, (new_title, json.dumps(messages), datetime.now(timezone.utc), conversation_id))
-            conn.commit()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"AI provider request failed: {type(exc).__name__}")
+            conn.execute("UPDATE conversations SET title=%s,messages=%s::jsonb,updated_at=%s WHERE id=%s",(new_title,json.dumps(messages),datetime.now(timezone.utc),conversation_id)); conn.commit()
+        maybe_update_summary(conversation_id,messages)
+    except Exception as exc: raise HTTPException(status_code=503,detail=f"Database request failed: {type(exc).__name__}")
+    return {"conversation_id":conversation_id,"answer":answer,"status":"success","ai_provider":"groq","model":model,
+            "message_count":len(messages),"document_sources":[x["filename"] for x in context],"sources":sources,
+            "retrieval_mode":context[0].get("retrieval") if context else ("disabled" if not request.use_documents else "no_match"),
+            "retrieval_scores":[x.get("score") for x in context],"document_scope":scope,
+            "reasoning_validation":validation is not None,"agent_mode":request.agent_mode,"agent_trace":trace}
 
-    sources = []
-    for i, x in enumerate(context, start=1):
-        sources.append({
-            "source_number": i,
-            "filename": x["filename"],
-            "document_id": x["document_id"],
-            "page_number": x.get("page_number"),
-            "chunk_index": x.get("chunk_index"),
-            "score": x.get("score"),
-            "relevance": x.get("relevance"),
-            "retrieval": x.get("retrieval"),
-        })
-    return {
-        "conversation_id": conversation_id,
-        "answer": answer,
-        "status": "success",
-        "ai_provider": "groq",
-        "model": model,
-        "message_count": len(messages),
-        "document_sources": [x["filename"] for x in context],
-        "sources": sources,
-        "retrieval_mode": context[0].get("retrieval") if context else ("disabled" if not request.use_documents else "no_match"),
-        "retrieval_scores": [x.get("score") for x in context],
-        "document_scope": scope,
-        "reasoning_validation": reasoning_validation is not None,
-    }
+
+@app.get("/documents/insights")
+def document_insights(document_ids: str | None = None):
+    ids=[x for x in (document_ids.split(",") if document_ids else []) if x]
+    return build_document_insights(ids)
+
+
+@app.get("/documents/{document_id}/insights")
+def single_document_insights(document_id: str):
+    return build_document_insights([document_id])
 
 
 @app.post("/ask")
 def ask(request: QuestionRequest):
     question = request.question.strip()
+    if len(question) > MAX_QUESTION_CHARS:
+        raise HTTPException(status_code=413, detail=f"Question is too long. Maximum is {MAX_QUESTION_CHARS} characters.")
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     context = retrieve_document_context(question, request.query_embedding, document_ids=request.document_ids) if request.use_documents else []
