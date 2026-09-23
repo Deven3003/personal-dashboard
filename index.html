@@ -37,6 +37,7 @@ main{padding:17px}.section{display:flex;justify-content:space-between;align-item
 .history{display:flex;gap:8px;overflow:auto;padding-bottom:8px}.history button{border:1px solid #d8e1ee;background:#fff;border-radius:12px;padding:8px 10px;white-space:nowrap;font-size:10px;color:#344054}.newchat{border:0;background:#0b63f6;color:#fff;border-radius:11px;padding:9px 11px;font-weight:700;font-size:11px}
 .doc-card{background:#fff;border-radius:14px;padding:12px;margin:8px 0;box-shadow:0 5px 18px #1e375a0d}.doc-name{font-weight:700;font-size:13px}.doc-meta{font-size:10px;color:#7b8494;margin-top:4px}.delete-doc{margin-top:8px;border:0;background:#fee2e2;color:#b91c1c;border-radius:9px;padding:7px 10px;font-size:10px;font-weight:700}
 .answer-content{font-size:13px;line-height:1.6}.answer-content h3{margin:4px 0 9px;font-size:16px}.answer-content p{margin:7px 0}.answer-content ul,.answer-content ol{margin:7px 0 7px 18px;padding:0}.answer-table-wrap{overflow-x:auto;margin:10px 0;border:1px solid #dbe4f0;border-radius:11px}.answer-table{width:100%;min-width:520px;border-collapse:separate;border-spacing:0;font-size:11px}.answer-table th{background:#eef4ff;padding:8px;text-align:left}.answer-table td{padding:8px;border-bottom:1px solid #edf1f6;vertical-align:top}.answer-source{margin-top:9px;padding-top:8px;border-top:1px solid #e6ebf2;font-size:10px;color:#7b8494}.source-card{background:#fff;border:1px solid #dce5f2;border-radius:11px;padding:8px;margin-top:6px}.scope-box{background:#f7faff;border:1px solid #dce6f5;border-radius:13px;padding:9px;margin:8px 0}.scope-list{max-height:120px;overflow:auto}.scope-item{display:flex;gap:7px;align-items:center;padding:5px 0;font-size:10px}.scope-item input{accent-color:#0b63f6}
+ .goal-row,.reminder-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #edf1f6}.goal-row:last-child,.reminder-row:last-child{border-bottom:0}.goal-icon{width:30px;height:30px;border-radius:10px;background:#edf3ff;color:#0b63f6;display:flex;align-items:center;justify-content:center;font-size:15px}.goal-main{flex:1}.goal-title{font-size:12px;font-weight:800}.goal-meta{font-size:10px;color:#7b8494;margin-top:2px}.progressbar{height:7px;background:#e8edf5;border-radius:99px;overflow:hidden;margin-top:6px}.progressbar i{display:block;height:100%;background:#0b63f6;border-radius:99px}.reminder-time{font-size:10px;color:#0b63f6;font-weight:800;white-space:nowrap}.more-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}.more-card{background:#fff;border:1px solid #e7edf5;border-radius:16px;padding:13px;cursor:pointer}.more-card b{display:block;font-size:12px;margin-top:6px}.more-card span{font-size:10px;color:#7b8494}.module-sheet{background:#fff;border-radius:18px;padding:16px;box-shadow:0 5px 18px #1e375a10}.module-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.module-action{border:0;background:#edf3ff;color:#0b63f6;border-radius:11px;padding:10px;font-size:11px;font-weight:700}.tiny-btn{border:0;background:#eef3f9;color:#344054;border-radius:9px;padding:6px 8px;font-size:10px;font-weight:700}
 nav{position:fixed;bottom:0;left:0;right:0;background:#fffffff5;border-top:1px solid #e4e8ef;display:flex;justify-content:center;z-index:10;padding:8px 0 calc(8px + env(safe-area-inset-bottom))}
 nav button{width:20%;border:0;background:transparent;text-align:center;font-size:10px;color:#687386}nav button.active{color:#0b63f6;font-weight:700}nav span{display:block;font-size:20px;margin-bottom:2px}@media(min-width:521px){nav{max-width:520px;margin:auto}}
 </style>
@@ -79,6 +80,10 @@ nav button{width:20%;border:0;background:transparent;text-align:center;font-size
 <div class="module" onclick="moduleInfo('Content')"><span class="icon">🎬</span><b>Content</b><span>YouTube & ideas</span></div>
 </div>
 
+<div class="section" style="margin-top:20px"><h2>Goals & Progress</h2><button class="tiny-btn" onclick="addGoal()">＋ Goal</button></div>
+<div class="card" id="goalsList"></div>
+<div class="section" style="margin-top:20px"><h2>Upcoming Reminders</h2><button class="tiny-btn" onclick="addReminder()">＋ Reminder</button></div>
+<div class="card" id="remindersList"></div>
 <div class="section" style="margin-top:20px"><h2>AI Insight</h2></div>
 <div class="insight">
 <b>🧠 Your Personal AI Brain</b>
@@ -136,12 +141,36 @@ nav button{width:20%;border:0;background:transparent;text-align:center;font-size
 </main>
 </section>
 
+<section id="more" class="hidden">
+<header><div class="small">Personal Control Center</div><div class="title">More •••</div><div class="quote">See your dashboard activity, goals and modules in one place.</div></header>
+<main>
+<div class="section"><h2>Dashboard Overview</h2></div>
+<div class="card" id="overviewCard"></div>
+<div class="section" style="margin-top:18px"><h2>Manage</h2></div>
+<div class="more-grid">
+<div class="more-card" onclick="addGoal()"><span>🎯</span><b>Add Goal</b><span>Track long-term progress</span></div>
+<div class="more-card" onclick="addReminder()"><span>⏰</span><b>Add Reminder</b><span>Keep important dates visible</span></div>
+<div class="more-card" onclick="dailyBriefing()"><span>🧠</span><b>AI Daily Briefing</b><span>Ask your AI what matters today</span></div>
+<div class="more-card" onclick="show('documents');loadDocuments()"><span>📚</span><b>Knowledge Base</b><span>Open your documents</span></div>
+</div>
+<div class="section" style="margin-top:18px"><h2>Life Modules</h2></div>
+<div class="more-grid">
+<div class="more-card" onclick="moduleInfo('Work')"><span>💼</span><b>Work</b><span>Office & responsibilities</span></div>
+<div class="more-card" onclick="moduleInfo('Resort')"><span>🏨</span><b>Resort</b><span>Business operations</span></div>
+<div class="more-card" onclick="moduleInfo('Finance')"><span>💰</span><b>Finance</b><span>Money & commitments</span></div>
+<div class="more-card" onclick="moduleInfo('Career')"><span>🚀</span><b>Career</b><span>Skills & growth</span></div>
+<div class="more-card" onclick="moduleInfo('Content')"><span>🎬</span><b>Content</b><span>YouTube & ideas</span></div>
+<div class="more-card" onclick="moduleInfo('AI Project')"><span>🤖</span><b>AI Project</b><span>RAG & development</span></div>
+</div>
+</main>
+</section>
+
 <nav>
 <button id="navHome" class="active" onclick="show('home')"><span>⌂</span>Home</button>
 <button id="navTasks" onclick="show('tasks')"><span>✓</span>Tasks</button>
 <button id="navChat" onclick="show('chat');loadConversations()"><span>🤖</span>AI</button>
 <button id="navDocs" onclick="show('documents');loadDocuments()"><span>📚</span>Docs</button>
-<button onclick="moduleInfo('More')"><span>•••</span>More</button>
+<button id="navMore" onclick="show('more');renderMore()"><span>•••</span>More</button>
 </nav>
 </div>
 
@@ -168,7 +197,16 @@ const defaultTasks=[
 {id:6,title:"Plan next Historic_ai topic",cat:"Content",done:false}
 ];
 let tasks=JSON.parse(localStorage.getItem("my_dashboard_tasks")||"null")||defaultTasks;
-function save(){localStorage.setItem("my_dashboard_tasks",JSON.stringify(tasks))}
+let goals=JSON.parse(localStorage.getItem("my_dashboard_goals")||"null")||[
+ {id:1,title:"Build Personal AI Dashboard",progress:65,target:100},
+ {id:2,title:"Grow technical skills",progress:40,target:100},
+ {id:3,title:"Grow Historic_ai content",progress:25,target:100}
+];
+let reminders=JSON.parse(localStorage.getItem("my_dashboard_reminders")||"null")||[
+ {id:1,title:"Review important documents",time:"Today"},
+ {id:2,title:"Plan tomorrow's priorities",time:"Evening"}
+];
+function save(){localStorage.setItem("my_dashboard_tasks",JSON.stringify(tasks));localStorage.setItem("my_dashboard_goals",JSON.stringify(goals));localStorage.setItem("my_dashboard_reminders",JSON.stringify(reminders))}
 function render(){
  const list=document.getElementById("tasksList"); if(list){list.innerHTML="";
  tasks.forEach(t=>{const d=document.createElement("div");d.className="task"+(t.done?" done":"");
@@ -184,8 +222,15 @@ function render(){
  document.getElementById("total").textContent=tasks.length;
  document.getElementById("completed").textContent=done;
  document.getElementById("progress").textContent=tasks.length-done;
+ renderGoals();renderReminders();
 }
 function addTask(){const title=prompt("What task do you want to add?");if(!title)return;const cat=prompt("Category","Personal")||"Personal";tasks.push({id:Date.now(),title,cat,done:false});save();render()}
+function renderGoals(){const box=document.getElementById("goalsList");if(!box)return;box.innerHTML="";goals.forEach(g=>{const pct=Math.max(0,Math.min(100,Number(g.progress)||0));const d=document.createElement("div");d.className="goal-row";d.innerHTML='<div class="goal-icon">🎯</div><div class="goal-main"><div class="goal-title"></div><div class="goal-meta">'+pct+'% complete</div><div class="progressbar"><i style="width:'+pct+'%"></i></div></div>';d.querySelector('.goal-title').textContent=g.title;box.appendChild(d)});if(!goals.length)box.innerHTML='<div class="doc-meta">No goals yet. Add your first goal.</div>'}
+function renderReminders(){const box=document.getElementById("remindersList");if(!box)return;box.innerHTML="";reminders.slice(0,4).forEach(r=>{const d=document.createElement("div");d.className="reminder-row";d.innerHTML='<div class="goal-icon">⏰</div><div class="goal-main"><div class="goal-title"></div></div><div class="reminder-time"></div>';d.querySelector('.goal-title').textContent=r.title;d.querySelector('.reminder-time').textContent=r.time;box.appendChild(d)});if(!reminders.length)box.innerHTML='<div class="doc-meta">No reminders yet.</div>'}
+function addGoal(){const title=prompt("Goal name");if(!title)return;let p=Number(prompt("Current progress (0-100)","0"));if(Number.isNaN(p))p=0;p=Math.max(0,Math.min(100,p));goals.push({id:Date.now(),title,progress:p,target:100});save();render();renderMore()}
+function addReminder(){const title=prompt("Reminder");if(!title)return;const time=prompt("When?","Today")||"Today";reminders.push({id:Date.now(),title,time});save();render();renderMore()}
+function renderMore(){const box=document.getElementById("overviewCard");if(!box)return;const done=tasks.filter(t=>t.done).length;const open=tasks.length-done;const goalAvg=goals.length?Math.round(goals.reduce((a,g)=>a+Number(g.progress||0),0)/goals.length):0;box.innerHTML='<div class="stats" style="margin-top:0"><div class="stat" style="background:#edf3ff;color:#172033"><b>'+open+'</b><span>Open Tasks</span></div><div class="stat" style="background:#edf3ff;color:#172033"><b>'+done+'</b><span>Completed</span></div><div class="stat" style="background:#edf3ff;color:#172033"><b>'+goalAvg+'%</b><span>Goal Avg.</span></div></div>'}
+function dailyBriefing(){show("chat");loadConversations().then(()=>quick("Give me a concise daily briefing using my current tasks, goals, reminders, project context and uploaded knowledge. Highlight what needs attention today."))}
 function clearCompleted(){tasks=tasks.filter(t=>!t.done);save();render()}
 function moduleInfo(name){
  if(name==="AI Project") {show("chat");loadConversations();return}
@@ -196,7 +241,7 @@ function show(id){
  document.querySelectorAll("section").forEach(s=>s.classList.add("hidden"));
  document.getElementById(id).classList.remove("hidden");
  document.querySelectorAll("nav button").forEach(b=>b.classList.remove("active"));
- const map={home:"navHome",tasks:"navTasks",chat:"navChat",documents:"navDocs"};if(map[id])document.getElementById(map[id]).classList.add("active");
+ const map={home:"navHome",tasks:"navTasks",chat:"navChat",documents:"navDocs",more:"navMore"};if(map[id])document.getElementById(map[id]).classList.add("active");
  window.scrollTo(0,0);
 }
 function escapeHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
@@ -240,7 +285,7 @@ async function loadInsights(){const box=document.getElementById("insights");box.
 async function deleteDocument(id){if(!confirm("Delete this document?"))return;try{const r=await fetch(API_BASE_URL+"/documents/"+id,{method:"DELETE"});if(!r.ok)throw new Error("HTTP "+r.status);await loadDocuments();await loadScopeOptions(selectedDocumentIds)}catch(e){document.getElementById("docStatus").textContent="Delete error: "+e.message}}
 const now=new Date(),h=now.getHours();document.getElementById("greeting").textContent=h<12?"Good morning 👋":h<18?"Good afternoon 👋":"Good evening 👋";
 document.getElementById("todayDate").textContent=now.toLocaleDateString("en-IN",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
-render();loadScopeOptions().catch(()=>{});
+render();renderMore();loadScopeOptions().catch(()=>{});
 </script>
 </body>
 </html>
