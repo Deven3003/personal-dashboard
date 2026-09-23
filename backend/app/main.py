@@ -2,7 +2,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 
 import psycopg
@@ -34,7 +34,7 @@ def cosine_similarity(a, b):
 
 app = FastAPI(
     title="Personal AI Dashboard API",
-    version="7.0.0",
+    version="8.0.0",
     description="Personal AI backend with persistent conversations, semantic RAG, source citations, page references, multi-document retrieval, and document-scoped conversations.",
 )
 app.add_middleware(
@@ -136,10 +136,10 @@ def root():
     return {
         "service": "personal-ai-dashboard",
         "status": "online",
-        "version": "7.0.0",
+        "version": "8.0.0",
         "features": [
             "groq-ai", "persistent-conversations", "semantic-vector-retrieval",
-            "source-citations", "page-references", "multi-document-qa", "document-scoped-conversations"
+            "source-citations", "page-references", "multi-document-qa", "document-scoped-conversations", "temporal-reasoning", "numeric-validation"
         ],
     }
 
@@ -490,7 +490,124 @@ def source_reference(item, number):
     return f"[SOURCE {number}] {item['filename']} — {page} — relevance {item.get('score', 0):.3f}"
 
 
-def call_ai(messages, document_context=None):
+MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def parse_date_value(day, month, year):
+    try:
+        value = datetime(int(year), int(month), int(day)).date()
+        return value
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_document_dates(text):
+    """Extract common human/ISO dates without requiring third-party date parsing."""
+    patterns = [
+        (re.compile(r"\b(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b", re.I), "long"),
+        (re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s*,?\s*(\d{4})\b", re.I), "long"),
+        (re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b"), "numeric"),
+        (re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"), "iso"),
+    ]
+    found = []
+    seen = set()
+    for pattern, kind in patterns:
+        for match in pattern.finditer(text):
+            if kind == "long":
+                day, month_name, year = match.groups()
+                month = MONTHS[month_name.lower()]
+                value = parse_date_value(day, month, year)
+            elif kind == "numeric":
+                day, month, year = match.groups()
+                value = parse_date_value(day, month, year)
+            else:
+                year, month, day = match.groups()
+                value = parse_date_value(day, month, year)
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            start = max(0, match.start() - 100)
+            end = min(len(text), match.end() + 100)
+            found.append({
+                "date": value,
+                "raw": match.group(0),
+                "context": text[start:end].replace("\n", " "),
+            })
+    return sorted(found, key=lambda x: x["date"])
+
+
+def build_reasoning_validation(question, document_context):
+    """Create deterministic guardrails for date-sensitive and numeric questions.
+
+    The LLM still writes the answer, but it receives machine-derived facts so it
+    cannot casually describe a past expiry as an upcoming one.
+    """
+    if not document_context:
+        return None
+
+    q = question.lower()
+    date_intent = any(term in q for term in (
+        "expire", "expires", "expiry", "expiration", "renew", "renewal",
+        "valid", "validity", "deadline", "due date", "due", "upcoming",
+        "soon", "when does", "when will",
+    ))
+    numeric_intent = any(term in q for term in (
+        "amount", "amounts", "premium", "price", "cost", "paid", "pay",
+        "sum", "total", "fee", "fees", "compare", "difference", "how much",
+        "calculate", "calculation",
+    ))
+    if not date_intent and not numeric_intent:
+        return None
+
+    today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+    lines = [f"VALIDATION DATE (India): {today.strftime('%d %B %Y')}"]
+
+    if date_intent:
+        expiry_terms = ("expiry", "expires", "expiration", "expire", "valid until", "validity", "renewal", "renew")
+        candidates = []
+        for item in document_context:
+            for found in extract_document_dates(item.get("content", "")):
+                context_lower = found["context"].lower()
+                if any(term in context_lower for term in expiry_terms):
+                    candidates.append((item, found))
+        if candidates:
+            lines.append("DATE FACTS FROM DOCUMENTS (machine-checked):")
+            for item, found in candidates[:12]:
+                value = found["date"]
+                if value < today:
+                    status = f"PAST — { (today - value).days } days before today's date"
+                elif value == today:
+                    status = "TODAY"
+                else:
+                    status = f"FUTURE — { (value - today).days } days from today"
+                page = f"page {item.get('page_number')}" if item.get("page_number") else f"chunk {int(item.get('chunk_index', 0)) + 1}"
+                lines.append(f"- {item['filename']} ({page}): {found['raw']} => {status}")
+            lines.append("RULE: If a document date is PAST, never describe it as a future/upcoming expiry. Say that the date has already passed and clearly distinguish that from any later renewal not present in the documents.")
+        else:
+            lines.append("No machine-validated expiry/validity date was found near date phrases in the retrieved document context. Do not invent one.")
+
+    if numeric_intent:
+        lines.append("NUMERIC RULES: Preserve monetary values exactly as stated in the retrieved sources. Do not invent, round, or silently change amounts. For comparisons, show the source value and label. For arithmetic, verify the calculation before stating a result; if the source does not provide enough inputs, say so.")
+        arithmetic = re.compile(r"(₹?\s*[\d,]+(?:\.\d+)?)\s*\+\s*(₹?\s*[\d,]+(?:\.\d+)?)\s*=\s*(₹?\s*[\d,]+(?:\.\d+)?)")
+        for item in document_context:
+            for match in arithmetic.finditer(item.get("content", "")):
+                def amount(raw):
+                    return float(raw.replace("₹", "").replace(",", "").strip())
+                try:
+                    a, b, claimed = map(amount, match.groups())
+                    expected = a + b
+                    lines.append(f"- Arithmetic check in {item['filename']}: {match.group(0)} => expected total ₹{expected:,.2f}; claimed total ₹{claimed:,.2f}.")
+                except ValueError:
+                    pass
+
+    return "\n".join(lines)
+
+
+def call_ai(messages, document_context=None, reasoning_validation=None):
     client = get_groq_client()
     model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
     system_prompt = """You are Personal AI, the user's private AI assistant inside their Personal Dashboard.
@@ -499,12 +616,16 @@ When document context is provided, answer using it when relevant. Do not invent 
 If the supplied document context does not contain the answer, say that the available documents do not provide enough information, then answer generally only if useful.
 Multiple documents may be supplied. Compare them when the user asks for comparison, differences, common points, or a combined answer.
 When document context is supplied, source labels such as [SOURCE 1] are authoritative metadata. You may mention source filenames and page numbers, but NEVER invent a page number or source.
+For date-sensitive questions, treat the machine-checked validation facts supplied below as authoritative. Explicitly distinguish a date stated in a document from your calculation relative to today's date.
+For numeric questions, preserve source amounts exactly and verify arithmetic before presenting a calculated result.
 Prefer a clean structure with headings, bullets, and Markdown tables when comparison or tabular information is useful."""
     if document_context:
         context_text = "\n\n".join(
             f"{source_reference(x, i + 1)}\n{x['content']}" for i, x in enumerate(document_context)
         )
         system_prompt += "\n\nDOCUMENT CONTEXT:\n" + context_text
+    if reasoning_validation:
+        system_prompt += "\n\nDETERMINISTIC REASONING VALIDATION:\n" + reasoning_validation
     completion = client.chat.completions.create(
         model=model,
         messages=[{"role": "system", "content": system_prompt}] + messages,
@@ -596,8 +717,9 @@ def conversation_ask(conversation_id: str, request: QuestionRequest):
     messages.append({"role": "user", "content": question})
     scope = request.document_ids if request.document_ids is not None else conversation.get("document_ids", [])
     context = retrieve_document_context(question, request.query_embedding, document_ids=scope) if request.use_documents else []
+    reasoning_validation = build_reasoning_validation(question, context)
     try:
-        answer, model = call_ai(messages, context)
+        answer, model = call_ai(messages, context, reasoning_validation)
         messages.append({"role": "assistant", "content": answer})
         new_title = conversation["title"] if conversation["title"] != "New conversation" else question[:60]
         with get_db() as conn:
@@ -634,6 +756,7 @@ def conversation_ask(conversation_id: str, request: QuestionRequest):
         "retrieval_mode": context[0].get("retrieval") if context else ("disabled" if not request.use_documents else "no_match"),
         "retrieval_scores": [x.get("score") for x in context],
         "document_scope": scope,
+        "reasoning_validation": reasoning_validation is not None,
     }
 
 
@@ -643,7 +766,8 @@ def ask(request: QuestionRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     context = retrieve_document_context(question, request.query_embedding, document_ids=request.document_ids) if request.use_documents else []
-    answer, model = call_ai([{"role": "user", "content": question}], context)
+    reasoning_validation = build_reasoning_validation(question, context)
+    answer, model = call_ai([{"role": "user", "content": question}], context, reasoning_validation)
     return {
         "answer": answer,
         "status": "success",
@@ -662,4 +786,5 @@ def ask(request: QuestionRequest):
             }
             for i, x in enumerate(context, start=1)
         ],
+        "reasoning_validation": reasoning_validation is not None,
     }
